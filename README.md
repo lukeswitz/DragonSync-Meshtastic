@@ -1,3 +1,5 @@
+#WIP The necessary cot_parser will be uploaded once fully tested
+
 # DragonSync-Meshtastic
 
 DragonSync-Meshtastic is a Python-based application designed to bridge data between multicast network messages and Meshtastic devices. It listens for Cursor-on-Target (CoT) messages transmitted via a multicast group, parses these messages, and relays them as JSON-formatted text to connected Meshtastic devices. This tool is particularly useful for integrating various data sources (such as system messages, drone telemetry, and electromagnetic spectrum alerts) into a single, robust communication system.
