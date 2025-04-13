@@ -1,4 +1,4 @@
-#WIP The necessary cot_parser will be uploaded once fully tested
+# WIP The necessary cot_parser will be uploaded once fully tested
 
 # DragonSync-Meshtastic
 
