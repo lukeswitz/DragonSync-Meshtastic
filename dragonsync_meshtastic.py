@@ -49,6 +49,18 @@ def parse_arguments():
         default=None,
         help="Serial device to use (e.g., /dev/ttyACM0)."
     )
+    parser.add_argument(
+        "--mcast-ip",
+        type=str,
+        default="239.2.3.1",
+        help="Multicast group IP address (default: 239.2.3.1)."
+    )
+    parser.add_argument(
+        "--mcast-port",
+        type=int,
+        default=6969,
+        help="Multicast port number (default: 6969)."
+    )
     return parser.parse_args()
 
 
@@ -128,8 +140,8 @@ def main():
     args = parse_arguments()
     interface = create_interface(args.port)
 
-    MCAST_GRP = '239.2.3.1'
-    MCAST_PORT = 6969
+    MCAST_GRP = args.mcast_ip
+    MCAST_PORT = args.mcast_port
     sock = setup_multicast_socket(MCAST_GRP, MCAST_PORT)
     logging.info(f"Listening for CoT multicast on {MCAST_GRP}:{MCAST_PORT}")
 
