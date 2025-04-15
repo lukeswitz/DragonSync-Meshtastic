@@ -70,7 +70,7 @@ DragonSync-Meshtastic acts as a middleware solution that integrates multiple dat
 
 2. **Install Dependencies:**
 
-   Ensure you have Python 3 installed. Then, install the required packages:
+   Most of what is needed is included in DragonOS/WarDragon. Ensure you have Python 3 installed. Then, install the required packages:
 
    ```bash
    pip install -r requirements.txt
