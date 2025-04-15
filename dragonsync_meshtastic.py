@@ -133,6 +133,36 @@ data_stream = None
 static_lat = 0.0
 static_lon = 0.0
 
+# --- Log File Handling ---
+def setup_logging(debug: bool, log_file: str = None):
+  """
+  Configures logging to console and optionally to a file.
+  Debug mode shows more verbose logs on console, otherwise only warnings and errors.
+  If log_file is specified, all logs are written to the file regardless of debug setting.
+  """
+  root_logger = logging.getLogger()
+  root_logger.setLevel(logging.DEBUG) # Capture all logs
+  root_logger.handlers = [] # Clear existing handlers
+  
+  formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+  
+  console_level = logging.DEBUG if debug else logging.WARNING
+  console_handler = logging.StreamHandler()
+  console_handler.setLevel(console_level)
+  console_handler.setFormatter(formatter)
+  root_logger.addHandler(console_handler)
+  
+  if log_file:
+    try:
+      file_handler = logging.FileHandler(log_file, mode='a')
+      file_handler.setLevel(logging.DEBUG)
+      file_handler.setFormatter(formatter)
+      root_logger.addHandler(file_handler)
+      logging.info(f"Log file initialized: {log_file}")
+    except (PermissionError, FileNotFoundError) as e:
+      logging.error(f"Failed to create log file at {log_file}: {e}")
+      logging.warning("Continuing with console logging only")
+
 
 # --- Command-Line Argument Parsing ---
 parser = argparse.ArgumentParser(
@@ -157,9 +187,17 @@ parser.add_argument("--fpv-port", type=str, default=None,
                     help="Serial port for FPV messages (e.g., /dev/ttyUSB0).")
 parser.add_argument("--fpv-baud", type=int, default=115200,
                     help="Baud rate for FPV serial messages (default: 115200).")
+parser.add_argument("--log-file", 
+                    help="Path to save logs (default: no file logging)")
+parser.add_argument("--debug", action="store_true",
+                    help="Enable debug logging.")
 args = parser.parse_args()
+setup_logging(args.debug, args.log_file)
+logging.info("Meshtastic Duplex starting up")
+logging.info(f"Debug mode: {'Enabled' if args.debug else 'Disabled'}")
+logging.info(f"Log file: {args.log_file if args.log_file else 'None'}")
 
-logging.basicConfig(level=logging.INFO)
+
 
 # --- Meshtastic Interface Initialization ---
 import meshtastic.serial_interface
@@ -496,3 +534,4 @@ if __name__ == "__main__":
         zmq_socket.close()
         zmq_context.term()
         logging.info("Clean shutdown complete.")
+      
