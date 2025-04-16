@@ -1,6 +1,10 @@
-# DragonSync-Meshtastic
+## DragonSync-Meshtastic
 
-DragonSync-Meshtastic is a Python-based application designed to bridge multicast network messages and Meshtastic devices. The application runs in duplex mode—listening for Cursor-on-Target (CoT) messages via a multicast group and relaying them as TAK packets (PLI and GeoChat) over a Meshtastic serial connection. FPV (First Person View) message processing has been removed from the main application and may be developed as a separate module in the future.
+DragonSync-Meshtastic is a Python-based application designed to bridge multicast network messages and Meshtastic devices. The application runs in duplex mode—listening for Cursor-on-Target (CoT) messages via a multicast group and relaying them as TAK packets (PLI and GeoChat) over a Meshtastic serial connection.
+
+For multicast CoT compatibility, [DragonSync](https://github.com/alphafox02/DragonSync) provides the necessary functionality.
+
+*FPV (First Person View) message processing has been removed from the main application and may be developed as a separate module in the future.*
 
 ## Table of Contents
 
