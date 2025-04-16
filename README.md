@@ -89,7 +89,6 @@ Run the application from the command line. For example:
 The application is fully configurable via command-line arguments, enabling you to:
 - Adjust multicast settings to match your network environment.
 - Specify the serial port for the Meshtastic device.
-- Set other parameters related to CoT message processing and ATAK packet construction.
 
 ## License
 
