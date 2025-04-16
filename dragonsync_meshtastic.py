@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Meshtastic Duplex
+DragonSync-Meshtastic
 
 A unified script to run a Meshtastic node in duplex mode:
  - Listens for CoT messages via UDP multicast, processes and flushes the latest updates,
    and transmits TAK PLI packets (with GeoChat for system messages) via the Meshtastic serial interface.
 
 Usage example:
-    ./meshtastic_duplex.py --port /dev/ttyACM0 --mcast 239.2.3.1 --mcast-port 6969
+    ./dragonsync_meshtastic.py --port /dev/ttyACM0 --mcast 239.2.3.1 --mcast-port 6969
 
 MIT License
 
