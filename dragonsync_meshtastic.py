@@ -5,12 +5,9 @@ Meshtastic Duplex
 A unified script to run a Meshtastic node in duplex mode:
  - Listens for CoT messages via UDP multicast, processes and flushes the latest updates,
    and transmits TAK PLI packets (with GeoChat for system messages) via the Meshtastic serial interface.
- - Optionally (with --fpv), also listens for FPV messages over a separate serial port,
-   enriches them with GPS data, and publishes them via a ZMQ PUB socket.
 
 Usage example:
-    ./meshtastic_duplex.py --port /dev/ttyACM0 --mcast 239.2.3.1 --mcast-port 6969 \
-        --zmq-port 4020 --fpv --fpv-port /dev/ttyUSB0 --fpv-baud 115200
+    ./meshtastic_duplex.py --port /dev/ttyACM0 --mcast 239.2.3.1 --mcast-port 6969
 
 MIT License
 
@@ -47,12 +44,10 @@ import xmltodict
 import time
 import math
 import asyncio
-import zmq
-import serial
-from gps3 import gps3
 
-# Import ATAK protobuf definitions
+# Import ATAK protobuf definitions and Meshtastic serial interface
 from meshtastic.protobuf import atak_pb2
+import meshtastic.serial_interface
 
 
 # --- Helper Functions ---
@@ -74,11 +69,6 @@ def shorten_callsign(callsign):
 
     For callsigns starting with 'wardragon-', 'drone-', 'pilot-', or 'home-',
     return the prefix plus the last 4 characters. Otherwise, return the last 4 characters.
-
-    Examples:
-      - 'wardragon-00e04c3618a3' becomes 'wardragon-18a3'
-      - 'pilot-abc1234' becomes 'pilot-1234'
-      - 'home-xyz9876' becomes 'home-9876'
     """
     prefixes = ["wardragon-", "drone-", "pilot-", "home-"]
     for prefix in prefixes:
@@ -87,59 +77,16 @@ def shorten_callsign(callsign):
     return callsign[-4:] if len(callsign) >= 4 else callsign
 
 
-# --- GPS Functions ---
-def init_gps_connection():
-    """
-    Initialize and return a GPSDSocket and DataStream instance.
-    """
-    gps_socket = gps3.GPSDSocket()
-    data_stream = gps3.DataStream()
-    try:
-        gps_socket.connect(host="127.0.0.1", port=2947)
-        gps_socket.watch()
-        logging.info("GPS connection established.")
-    except Exception as e:
-        logging.error("Failed to initialize GPS connection: %s", e)
-        gps_socket, data_stream = None, None
-    return gps_socket, data_stream
-
-
-def get_gps_location(gps_socket, data_stream):
-    """
-    Attempt to get GPS location from the gpsd connection.
-    Returns a tuple (lat, lon) or (0.0, 0.0) on failure.
-    """
-    try:
-        new_data = next(gps_socket)
-        if new_data:
-            data_stream.unpack(new_data)
-            lat = data_stream.TPV.get("lat", 0.0)
-            lon = data_stream.TPV.get("lon", 0.0)
-            return lat, lon
-    except Exception as e:
-        logging.error("Error getting GPS location: %s", e)
-    return 0.0, 0.0
-
-
 # --- Global Throttling & State Setup ---
 GEO_CHAT_INTERVAL = 10  # seconds between GeoChat transmissions per unique callsign
 last_geo_chat_sent = {}
 latest_updates = {}  # Latest update per unique (shortened) callsign
 tx_lock = asyncio.Lock()  # Async lock for serializing radio transmissions
 
-# Global GPS state variables
-gps_socket = None
-data_stream = None
-static_lat = 0.0
-static_lon = 0.0
-
 
 # --- Command-Line Argument Parsing ---
 parser = argparse.ArgumentParser(
-    description=(
-        "Meshtastic Duplex: Async CoT listener (TX) and radio FPV receiver with GPS "
-        "enrichment and ZMQ publishing. Use --fpv to enable FPV features."
-    )
+    description="Meshtastic Duplex: Async CoT listener and radio transmitter for the Meshtastic ATAK plugin."
 )
 parser.add_argument("--port", type=str, default=None,
                     help="Serial device for Meshtastic (e.g., /dev/ttyACM0).")
@@ -147,22 +94,11 @@ parser.add_argument("--mcast", type=str, default="239.2.3.1",
                     help="Multicast group IP (default: 239.2.3.1).")
 parser.add_argument("--mcast-port", type=int, default=6969,
                     help="Multicast port (default: 6969).")
-parser.add_argument("--zmq-port", type=int, default=4020,
-                    help="ZMQ port for publishing FPV messages (default: 4020).")
-parser.add_argument("--stationary", action="store_true",
-                    help="If set, use static GPS coordinates obtained at startup.")
-parser.add_argument("--fpv", action="store_true",
-                    help="Enable FPV reception features (radio RX, GPS enrichment, ZMQ publishing).")
-parser.add_argument("--fpv-port", type=str, default=None,
-                    help="Serial port for FPV messages (e.g., /dev/ttyUSB0).")
-parser.add_argument("--fpv-baud", type=int, default=115200,
-                    help="Baud rate for FPV serial messages (default: 115200).")
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO)
 
 # --- Meshtastic Interface Initialization ---
-import meshtastic.serial_interface
 if args.port:
     logging.info(f"Using Meshtastic device (devPath): {args.port}")
     interface = meshtastic.serial_interface.SerialInterface(devPath=args.port)
@@ -181,41 +117,18 @@ mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
 sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 logging.info("Multicast socket bound on %s:%d", MCAST_GRP, MCAST_PORT)
 
-# --- ZMQ Publisher Setup (for FPV messages) ---
-zmq_context = zmq.Context()
-zmq_socket = zmq_context.socket(zmq.PUB)
-zmq_socket.setsockopt(zmq.SNDHWM, 1000)
-zmq_socket.setsockopt(zmq.LINGER, 0)
-zmq_endpoint = f"tcp://0.0.0.0:{args.zmq_port}"
-try:
-    zmq_socket.bind(zmq_endpoint)
-    logging.info("ZMQ PUB socket bound to %s", zmq_endpoint)
-except zmq.ZMQError as e:
-    logging.error("Failed to bind ZMQ socket: %s", e)
-    exit(1)
-
-# --- Initialize GPS for FPV Enrichment ---
-if args.stationary:
-    gps_socket, data_stream = init_gps_connection()
-    static_lat, static_lon = get_gps_location(gps_socket, data_stream)
-    if gps_socket:
-        gps_socket.close()
-        gps_socket, data_stream = None, None
-    logging.info("Using static GPS coordinates: lat=%s, lon=%s", static_lat, static_lon)
-else:
-    gps_socket, data_stream = init_gps_connection()
-
 
 # --- CoT Parsing ---
 def parse_cot(xml_data):
     """
     Parse a CoT (Cursor-on-Target) XML message and return a list of message dicts.
-    
-    For 'drone-' events, build a drone message.
-    For 'wardragon-' events, build a system message.
-    For messages starting with 'pilot-' or 'home-', assign corresponding types.
     """
-    cot_dict = xmltodict.parse(xml_data)
+    try:
+        cot_dict = xmltodict.parse(xml_data)
+    except Exception as e:
+        logging.error("Error parsing CoT XML: %s", e)
+        return []
+
     event = cot_dict.get("event", {})
     uid = event.get("@uid", "unknown")
     point = event.get("point", {})
@@ -304,7 +217,7 @@ def build_atak_pli_packet(msg):
 def build_atak_geochat_packet(msg):
     """
     Build a TAKPacket with a GeoChat payload for system messages.
-    Extracts key metrics (CPU, Temperature, AD936X, Zynq) from remarks.
+    Extracts key metrics from remarks.
     """
     packet = atak_pb2.TAKPacket()
     packet.is_compressed = False
@@ -355,29 +268,28 @@ async def send_packets_async(msg):
                 logging.info("Sent ATAK PLI packet.")
             except Exception as e:
                 logging.error("Error sending PLI packet: %s", e)
-    if msg.get("type") not in ["system", "pilot", "home"]:
-        logging.debug(f"GeoChat skipped for {shorten_callsign(msg['callsign'])} (not system/pilot/home).")
-        return
-    # For pilot and home messages, you might choose to send them as GeoChat too.
-    # Here we treat them similarly to system messages.
-    unique_id = shorten_callsign(msg["callsign"])
-    now = time.time()
-    last_time = last_geo_chat_sent.get(unique_id, 0)
-    if now - last_time >= GEO_CHAT_INTERVAL:
-        last_geo_chat_sent[unique_id] = now
-        geochat_packet = build_atak_geochat_packet(msg)
-        if geochat_packet is not None:
-            async with tx_lock:
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda: interface.sendData(geochat_packet, portNum=72, wantAck=False)
-                    )
-                    logging.info("Sent ATAK GeoChat packet.")
-                except Exception as e:
-                    logging.error("Error sending GeoChat packet: %s", e)
+    # For system, pilot, and home messages, send as GeoChat (if throttling permits)
+    if msg.get("type") in ["system", "pilot", "home"]:
+        unique_id = shorten_callsign(msg["callsign"])
+        now = time.time()
+        last_time = last_geo_chat_sent.get(unique_id, 0)
+        if now - last_time >= GEO_CHAT_INTERVAL:
+            last_geo_chat_sent[unique_id] = now
+            geochat_packet = build_atak_geochat_packet(msg)
+            if geochat_packet is not None:
+                async with tx_lock:
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            lambda: interface.sendData(geochat_packet, portNum=72, wantAck=False)
+                        )
+                        logging.info("Sent ATAK GeoChat packet.")
+                    except Exception as e:
+                        logging.error("Error sending GeoChat packet: %s", e)
+        else:
+            logging.debug("GeoChat throttled for %s.", unique_id)
     else:
-        logging.debug(f"GeoChat throttled for {unique_id}.")
+        logging.debug("GeoChat skipped for %s (not system/pilot/home).", shorten_callsign(msg["callsign"]))
 
 
 # --- Asynchronous Receiver for CoT (UDP) ---
@@ -386,7 +298,7 @@ async def cot_receiver():
     loop = asyncio.get_running_loop()
     while True:
         data, addr = await loop.run_in_executor(None, sock.recvfrom, 8192)
-        logging.debug(f"Received CoT from {addr}")
+        logging.debug("Received CoT from %s", addr)
         messages = parse_cot(data.decode("utf-8"))
         for msg in messages:
             unique_id = shorten_callsign(msg["callsign"])
@@ -406,82 +318,12 @@ async def flush_updates(interval=1):
         await asyncio.sleep(interval)
 
 
-# --- FPV Serial Reading for --fpv Mode ---
-RECONNECT_DELAY = 5  # seconds delay for FPV serial reconnection
-
-
-def read_fpv_serial(fpv_port, baud_rate):
-    """Continuously open and read lines from the FPV serial port."""
-    while True:
-        try:
-            with serial.Serial(fpv_port, baud_rate, timeout=1) as ser:
-                logging.info("Connected to FPV serial %s at %d baud.", fpv_port, baud_rate)
-                while True:
-                    line = ser.readline().decode("utf-8", errors="replace").strip()
-                    if line:
-                        logging.debug("FPV raw data: %s", line)
-                        yield line
-        except serial.SerialException as e:
-            logging.error("FPV serial error: %s. Reconnecting in %d seconds...", e, RECONNECT_DELAY)
-            time.sleep(RECONNECT_DELAY)
-        except Exception as e:
-            logging.exception("Unexpected FPV error: %s", e)
-            time.sleep(RECONNECT_DELAY)
-
-
-# --- Asynchronous FPV Receiver ---
-async def fpv_receiver(fpv_port, baud_rate):
-    """
-    Asynchronously read FPV messages from the specified serial port,
-    enrich them with GPS data, and publish via ZMQ.
-    """
-    loop = asyncio.get_running_loop()
-    fpv_gen = read_fpv_serial(fpv_port, baud_rate)
-    while True:
-        try:
-            line = await loop.run_in_executor(None, next, fpv_gen)
-        except StopIteration:
-            continue
-        logging.info(f"FPV received: {line}")
-        process_rx_data(line)
-
-
-def process_rx_data(rx_data):
-    """
-    Process received FPV data.
-    Attempt to parse JSON; if successful, enrich it with GPS coordinates
-    (live or static) and publish via the ZMQ PUB socket.
-    """
-    try:
-        msg = json.loads(rx_data)
-    except json.JSONDecodeError:
-        logging.warning("Failed to parse FPV JSON: %s", rx_data)
-        return
-    if not args.stationary and gps_socket and data_stream:
-        lat, lon = get_gps_location(gps_socket, data_stream)
-    else:
-        lat, lon = static_lat, static_lon
-    msg["gps_lat"] = lat
-    msg["gps_lon"] = lon
-    try:
-        outgoing_message = json.dumps(msg)
-        logging.info("Outgoing ZMQ FPV message: %s", outgoing_message)
-        zmq_socket.send_string(outgoing_message)
-        logging.info("Published FPV message via ZMQ.")
-    except Exception as e:
-        logging.error("Error publishing FPV message via ZMQ: %s", e)
-
-
 # --- Main Async Function ---
 async def main_async():
     tasks = [
         asyncio.create_task(cot_receiver()),
         asyncio.create_task(flush_updates(interval=1))
     ]
-    if args.fpv and args.fpv_port:
-        tasks.append(asyncio.create_task(fpv_receiver(args.fpv_port, args.fpv_baud)))
-    else:
-        logging.info("FPV receiver disabled (use --fpv and --fpv-port to enable).")
     await asyncio.gather(*tasks)
 
 
@@ -493,6 +335,4 @@ if __name__ == "__main__":
         logging.info("KeyboardInterrupt received. Stopping...")
     finally:
         interface.close()
-        zmq_socket.close()
-        zmq_context.term()
         logging.info("Clean shutdown complete.")
