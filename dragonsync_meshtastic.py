@@ -95,12 +95,12 @@ def shorten_callsign(cs: str) -> str:
     return cs[-4:] if len(cs) >= 4 else cs
 
 # --- Throttle & Cleanup Settings ---
-DRONE_PLI_INTERVAL = 5       # seconds between drone PLIs
-PILOT_HOME_PLI_INTERVAL = 60 # seconds between pilot/home PLIs
-DRONE_GEO_INTERVAL = 10      # seconds between drone GeoChats
-PILOT_HOME_GEO_INTERVAL = 30 # seconds between pilot/home GeoChats
-SYSTEM_GEO_INTERVAL = 10     # seconds between system GeoChats
-STALE_TIMEOUT = 300          # seconds before dropping stale
+DRONE_PLI_INTERVAL = 5        # seconds between drone PLIs
+PILOT_HOME_PLI_INTERVAL = 60  # seconds between pilot/home/system PLIs
+DRONE_GEO_INTERVAL = 10       # seconds between drone GeoChats
+PILOT_HOME_GEO_INTERVAL = 30  # seconds between pilot/home GeoChats
+SYSTEM_GEO_INTERVAL = 10      # seconds between system GeoChats
+STALE_TIMEOUT = 300           # seconds before dropping stale
 
 # --- Global State ---
 last_sent_pli = {}        # uid -> timestamp
@@ -136,21 +136,22 @@ def build_atak_geochat_packet(msg):
     pkt = atak_pb2.TAKPacket(is_compressed=False)
 
     full_cs = msg['callsign']
-    # use short CS in header for system, full CS otherwise
-    header_cs = shorten_callsign(full_cs) if msg['type'] == 'system' else full_cs
-    pkt.contact.callsign = pkt.contact.device_callsign = safe_str(header_cs, 120)
+    header_cs = (shorten_callsign(full_cs)
+                 if msg['type'] == 'system' else full_cs)
+    pkt.contact.callsign = pkt.contact.device_callsign = safe_str(
+        header_cs, 120)
 
-    # always include a PLI so ATAC can place it on the map
-    pkt.pli.latitude_i = int(msg['lat'] * 1e7)
+    # always include a PLI so ATAK can place it on the map
+    pkt.pli.latitude_i  = int(msg['lat'] * 1e7)
     pkt.pli.longitude_i = int(msg['lon'] * 1e7)
-    pkt.pli.altitude = int(msg['alt'])
+    pkt.pli.altitude    = int(msg['alt'])
 
-    # choose which text to send
     if msg['type'] == 'system':
         remarks = msg.get('remarks', '')
         cpu_match = re.search(r"CPU Usage:\s*([\d\.]+)%", remarks)
         tmp_match = re.search(r"Temperature:\s*([\d\.]+)°C", remarks)
-        pluto_match = re.search(r"(?:Pluto|AD936X)\s*Temp:\s*([\w\./]+)", remarks)
+        pluto_match = re.search(r"(?:Pluto|AD936X)\s*Temp:\s*([\w\./]+)",
+                                remarks)
         zynq_match = re.search(r"Zynq Temp:\s*([\w\./]+)", remarks)
 
         text = (
@@ -170,7 +171,6 @@ def build_atak_geochat_packet(msg):
     else:  # pilot or home
         text = full_cs
 
-    # now stuff it into the chat payload
     pkt.chat.message     = safe_str(text, 256)
     pkt.chat.to          = pkt.chat.to_callsign = "All Chat Rooms"
     pkt.group.role       = atak_pb2.MemberRole.TeamMember
@@ -255,7 +255,7 @@ def parse_zmq_drone(raw):
         'speed':    info['speed'],
         'remarks':  remark,
         'mac':      info['mac'],
-        'rssi':     info['rssi'],        # ← include the RSSI!
+        'rssi':     info['rssi'],
     }
     if 'caa' in info:
         entry['caa'] = info['caa']
@@ -315,9 +315,12 @@ async def send_packets_async(msg, iface, debug=False):
     now = time.time()
 
     # PLI throttle
-    interval = (DRONE_PLI_INTERVAL if msg['type'] == 'drone'
-                else PILOT_HOME_PLI_INTERVAL)
-    if now - last_sent_pli.get(uid, 0) >= interval:
+    if msg['type'] == 'drone':
+        pli_int = DRONE_PLI_INTERVAL
+    else:
+        pli_int = PILOT_HOME_PLI_INTERVAL
+
+    if now - last_sent_pli.get(uid, 0) >= pli_int:
         data = build_atak_pli_packet(msg)
         if debug:
             debug_proto(f'PLI {uid}', data)
@@ -331,12 +334,12 @@ async def send_packets_async(msg, iface, debug=False):
     # GeoChat throttle
     if msg['type'] == 'drone':
         geo_int = DRONE_GEO_INTERVAL
-    elif msg['type'] in ('pilot', 'home'):
+    elif msg['type'] == 'system':
+        geo_int = SYSTEM_GEO_INTERVAL
+    else:  # pilot or home
         geo_int = PILOT_HOME_GEO_INTERVAL
-    else:
-        geo_int = 0
 
-    if geo_int and now - last_sent_geochat.get(uid, 0) >= geo_int:
+    if now - last_sent_geochat.get(uid, 0) >= geo_int:
         data = build_atak_geochat_packet(msg)
         if debug:
             debug_proto(f'GeoChat {uid}', data)
@@ -362,7 +365,7 @@ async def drone_listener(host, port):
             last_seen[uid] = time.time()
 
 
-async def system_listener(host, port, iface, debug=False):
+async def system_listener(host, port):
     ctx = zmq.asyncio.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://{host}:{port}")
@@ -371,14 +374,9 @@ async def system_listener(host, port, iface, debug=False):
     while True:
         raw = await sock.recv_json()
         for m in parse_zmq_system(raw):
-            data = build_atak_geochat_packet(m)
-            if debug:
-                debug_proto(f'SYSTEM GeoChat {m["callsign"]}', data)
-            async with tx_lock:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: iface.sendData(data, portNum=72, wantAck=False)
-                )
-            logger.info(f'Sent SYSTEM GeoChat for {m["callsign"]}')
+            uid = shorten_callsign(m['callsign'])
+            latest_updates[uid] = m
+            last_seen[uid] = time.time()
         await asyncio.sleep(0)
 
 
@@ -391,11 +389,10 @@ async def flush_updates(iface, debug=False):
                 last_seen.pop(uid, None)
                 latest_updates.pop(uid, None)
                 logger.info(f'Dropped stale {uid}')
-        # send pending drone/pilot/home updates
+        # send all pending updates, including system
         for uid, msg in list(latest_updates.items()):
             latest_updates.pop(uid, None)
-            if msg['type'] != 'system':
-                await send_packets_async(msg, iface, debug)
+            await send_packets_async(msg, iface, debug)
         await asyncio.sleep(1)
 
 
@@ -407,8 +404,7 @@ async def main():
     logger.info('Meshtastic interface ready')
     await asyncio.gather(
         drone_listener(args.zmq_host, args.zmq_drone_port),
-        system_listener(args.zmq_host, args.zmq_system_port,
-                        iface, args.debug),
+        system_listener(args.zmq_host, args.zmq_system_port),
         flush_updates(iface, args.debug)
     )
 
