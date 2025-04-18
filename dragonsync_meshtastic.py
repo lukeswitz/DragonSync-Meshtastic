@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
-DragonSync-Meshtastic
-
-A unified script to run a Meshtastic node in duplex mode:
- - Listens for CoT messages via UDP multicast, processes and flushes the latest updates,
-   and transmits TAK PLI packets (with GeoChat for system messages) via the Meshtastic serial interface.
-
-Usage example:
-    ./dragonsync_meshtastic.py --port /dev/ttyACM0 --mcast 239.2.3.1 --mcast-port 6969
+DragonSync‑Meshtastic (ZMQ→Meshtastic with native asyncio, full throttling & stale cleanup)
 
 MIT License
 
@@ -17,7 +10,7 @@ Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
+copies of the Software, and to permit persons to whom the Software are
 furnished to do so, subject to the following conditions:
 
 The above copyright notice and this permission notice shall be included in all
@@ -32,307 +25,389 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
+
 __version__ = "1.0.0"
 
 import argparse
-import json
 import logging
 import re
-import socket
-import struct
-import xmltodict
 import time
-import math
 import asyncio
 
-# Import ATAK protobuf definitions and Meshtastic serial interface
+import zmq.asyncio
 from meshtastic.protobuf import atak_pb2
 import meshtastic.serial_interface
 
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser(
+    description="DragonSync‑Meshtastic: ZMQ→Meshtastic with asyncio, full throttling & cleanup"
+)
+parser.add_argument('--port', help='Meshtastic serial port')
+parser.add_argument('--zmq-host', default='127.0.0.1',
+                    help='ZMQ server hostname or IP')
+parser.add_argument('--zmq-drone-port', type=int, default=4224,
+                    help='ZMQ port for drone telemetry')
+parser.add_argument('--zmq-system-port', type=int, default=4225,
+                    help='ZMQ port for system status')
+parser.add_argument('-d', '--debug', action='store_true',
+                    help='Show PLI/GeoChat protobuf dumps')
+parser.add_argument('--meshtastic-debug', action='store_true',
+                    help='Enable Meshtastic library logs')
+args = parser.parse_args()
 
-# --- Helper Functions ---
+# --- Logging Setup ---
+level = logging.DEBUG if args.debug else logging.INFO
+logging.basicConfig(level=level,
+                    format='%(asctime)s %(levelname)s %(message)s')
+meshtastic_level = logging.DEBUG if args.meshtastic_debug else logging.CRITICAL
+logging.getLogger('meshtastic').setLevel(meshtastic_level)
+logger = logging.getLogger(__name__)
+
+# --- Helpers ---
 def safe_str(val, max_size):
-    """Convert a value to a string and truncate to max_size characters."""
-    s = str(val) if val is not None else ""
+    s = str(val) if val is not None else ''
     return s[:max_size]
 
 
 def clamp_int(val, bits):
-    """Clamp an integer to the maximum value allowed for 'bits' bits (unsigned)."""
     max_val = (1 << bits) - 1
-    return max(0, min(int(val), max_val))
-
-
-def shorten_callsign(callsign):
-    """
-    Return a shortened version of the callsign.
-
-    For callsigns starting with 'wardragon-', 'drone-', 'pilot-', or 'home-',
-    return the prefix plus the last 4 characters. Otherwise, return the last 4 characters.
-    """
-    prefixes = ["wardragon-", "drone-", "pilot-", "home-"]
-    for prefix in prefixes:
-        if callsign.startswith(prefix):
-            return prefix + callsign[-4:]
-    return callsign[-4:] if len(callsign) >= 4 else callsign
-
-
-# --- Global Throttling & State Setup ---
-GEO_CHAT_INTERVAL = 10  # seconds between GeoChat transmissions per unique callsign
-last_geo_chat_sent = {}
-latest_updates = {}  # Latest update per unique (shortened) callsign
-tx_lock = asyncio.Lock()  # Async lock for serializing radio transmissions
-
-
-# --- Command-Line Argument Parsing ---
-parser = argparse.ArgumentParser(
-    description="Meshtastic Duplex: Async CoT listener and radio transmitter for the Meshtastic ATAK plugin."
-)
-parser.add_argument("--port", type=str, default=None,
-                    help="Serial device for Meshtastic (e.g., /dev/ttyACM0).")
-parser.add_argument("--mcast", type=str, default="239.2.3.1",
-                    help="Multicast group IP (default: 239.2.3.1).")
-parser.add_argument("--mcast-port", type=int, default=6969,
-                    help="Multicast port (default: 6969).")
-args = parser.parse_args()
-
-logging.basicConfig(level=logging.INFO)
-
-# --- Meshtastic Interface Initialization ---
-if args.port:
-    logging.info(f"Using Meshtastic device (devPath): {args.port}")
-    interface = meshtastic.serial_interface.SerialInterface(devPath=args.port)
-else:
-    logging.info("No Meshtastic device specified; using auto-detection.")
-    interface = meshtastic.serial_interface.SerialInterface()
-logging.info("Meshtastic interface created successfully.")
-
-# --- UDP Multicast Setup (for CoT messages) ---
-MCAST_GRP = args.mcast
-MCAST_PORT = args.mcast_port
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind((MCAST_GRP, MCAST_PORT))
-mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
-sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-logging.info("Multicast socket bound on %s:%d", MCAST_GRP, MCAST_PORT)
-
-
-# --- CoT Parsing ---
-def parse_cot(xml_data):
-    """
-    Parse a CoT (Cursor-on-Target) XML message and return a list of message dicts.
-    """
     try:
-        cot_dict = xmltodict.parse(xml_data)
-    except Exception as e:
-        logging.error("Error parsing CoT XML: %s", e)
-        return []
-
-    event = cot_dict.get("event", {})
-    uid = event.get("@uid", "unknown")
-    point = event.get("point", {})
-    detail = event.get("detail", {})
-    callsign = detail.get("contact", {}).get("@callsign", uid)
-    lat = float(point.get("@lat", 0))
-    lon = float(point.get("@lon", 0))
-    alt = float(point.get("@hae", 0))
-    remarks = detail.get("remarks", "")
-    messages = []
-    if uid.startswith("drone-"):
-        msg = {"callsign": callsign,
-               "lat": lat,
-               "lon": lon,
-               "alt": alt,
-               "remarks": remarks,
-               "type": "drone"}
-        messages.append(msg)
-    elif uid.startswith("wardragon-"):
-        msg = {"callsign": callsign,
-               "lat": lat,
-               "lon": lon,
-               "alt": alt,
-               "remarks": remarks,
-               "type": "system"}
-        messages.append(msg)
-    elif uid.startswith("pilot-"):
-        msg = {"callsign": callsign,
-               "lat": lat,
-               "lon": lon,
-               "alt": alt,
-               "remarks": remarks,
-               "type": "pilot"}
-        messages.append(msg)
-    elif uid.startswith("home-"):
-        msg = {"callsign": callsign,
-               "lat": lat,
-               "lon": lon,
-               "alt": alt,
-               "remarks": remarks,
-               "type": "home"}
-        messages.append(msg)
-    else:
-        msg = {"callsign": callsign,
-               "lat": lat,
-               "lon": lon,
-               "alt": alt,
-               "remarks": remarks,
-               "type": "unknown"}
-        messages.append(msg)
-        logging.warning("Received unknown type; processing as generic PLI.")
-    for msg in messages:
-        logging.info("Parsed CoT message: %s", msg)
-    return messages
+        ival = int(val)
+    except (TypeError, ValueError):
+        ival = 0
+    return max(0, min(ival, max_val))
 
 
-# --- ATAK Packet Builders ---
+def parse_float(v, default=0.0):
+    m = re.search(r'[-+]?\d*\.?\d+', str(v))
+    if not m:
+        return default
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return default
+
+
+def shorten_callsign(cs: str) -> str:
+    prefixes = ['wardragon-', 'drone-', 'pilot-', 'home-']
+    for p in prefixes:
+        if cs.startswith(p):
+            return p + cs[-4:]
+    return cs[-4:] if len(cs) >= 4 else cs
+
+# --- Throttle & Cleanup Settings ---
+DRONE_PLI_INTERVAL = 5        # seconds between drone PLIs
+PILOT_HOME_PLI_INTERVAL = 60  # seconds between pilot/home/system PLIs
+DRONE_GEO_INTERVAL = 10       # seconds between drone GeoChats
+PILOT_HOME_GEO_INTERVAL = 30  # seconds between pilot/home GeoChats
+SYSTEM_GEO_INTERVAL = 10      # seconds between system GeoChats
+STALE_TIMEOUT = 300           # seconds before dropping stale
+
+# --- Global State ---
+last_sent_pli = {}        # uid -> timestamp
+last_sent_geochat = {}    # uid -> timestamp
+last_seen = {}            # uid -> timestamp
+latest_updates = {}       # uid -> msg dict
+mac_to_serial = {}        # mac -> serial id
+pending_caa = {}          # mac -> caa id buffer
+tx_lock = asyncio.Lock()  # serialize radio sends
+
+# --- Packet Builders ---
 def build_atak_pli_packet(msg):
-    """
-    Build a TAKPacket with a PLI payload from a CoT message.
-    Uses the shortened callsign.
-    """
-    if msg["type"] == "unknown":
-        logging.warning("Unknown message type; skipping TAKPacket construction.")
-        return None
-    packet = atak_pb2.TAKPacket()
-    packet.is_compressed = False
-    short_callsign = shorten_callsign(msg["callsign"])
-    packet.contact.callsign = safe_str(short_callsign, 120)
-    packet.contact.device_callsign = safe_str(short_callsign, 120)
-    packet.pli.latitude_i = int(msg["lat"] * 1e7)
-    packet.pli.longitude_i = int(msg["lon"] * 1e7)
-    packet.pli.altitude = int(msg["alt"])
-    packet.pli.speed = clamp_int(msg.get("speed", 0), 16)
-    packet.pli.course = clamp_int(msg.get("course", 0), 16)
-    packet.group.role = atak_pb2.MemberRole.TeamMember
-    packet.group.team = atak_pb2.Team.Cyan
-    logging.info("Constructed PLI: lat=%d, lon=%d, alt=%d, course=%d",
-                 packet.pli.latitude_i, packet.pli.longitude_i,
-                 packet.pli.altitude, packet.pli.course)
-    serialized = packet.SerializeToString()
-    logging.info("Serialized TAKPacket (PLI), length: %d bytes", len(serialized))
-    return serialized
+    pkt = atak_pb2.TAKPacket(is_compressed=False)
+    sc = safe_str(shorten_callsign(msg['callsign']), 120)
+    pkt.contact.callsign = pkt.contact.device_callsign = sc
+    pkt.pli.latitude_i  = int(msg['lat'] * 1e7)
+    pkt.pli.longitude_i = int(msg['lon'] * 1e7)
+    pkt.pli.altitude    = int(msg['alt'])
+    pkt.pli.speed       = clamp_int(msg.get('speed', 0), 16)
+    pkt.pli.course      = clamp_int(msg.get('course', 0), 16)
+    pkt.group.role      = atak_pb2.MemberRole.TeamMember
+    pkt.group.team      = atak_pb2.Team.Cyan
+    return pkt.SerializeToString()
 
 
 def build_atak_geochat_packet(msg):
     """
-    Build a TAKPacket with a GeoChat payload for system messages.
-    Extracts key metrics from remarks.
+    Build a TAKPacket with a GeoChat payload:
+      - system messages get a shortened callsign header and parsed stats
+      - drone messages get the full callsign + RSSI/MAC
+      - pilot/home just get the full callsign
     """
-    packet = atak_pb2.TAKPacket()
-    packet.is_compressed = False
-    short_callsign = shorten_callsign(msg["callsign"])
-    packet.contact.callsign = safe_str(short_callsign, 120)
-    packet.contact.device_callsign = safe_str(short_callsign, 120)
-    packet.pli.latitude_i = int(msg["lat"] * 1e7)
-    packet.pli.longitude_i = int(msg["lon"] * 1e7)
-    packet.pli.altitude = int(msg["alt"])
-    remarks = msg.get("remarks", "")
-    cpu_match = re.search(r"CPU Usage:\s*([\d\.]+)%", remarks)
-    temp_match = re.search(r"Temperature:\s*([\d\.]+)°C", remarks)
-    ad936x_match = re.search(r"(?:Pluto|AD936X)\s*Temp:\s*([\w./]+)", remarks)
-    zynq_match = re.search(r"Zynq Temp:\s*([\w./]+)", remarks)
-    cpu_val = cpu_match.group(1) if cpu_match else "N/A"
-    temp_val = temp_match.group(1) if temp_match else "N/A"
-    ad936x_val = ad936x_match.group(1) if ad936x_match else "N/A"
-    zynq_val = zynq_match.group(1) if zynq_match else "N/A"
-    detailed_message = (
-        f"{short_callsign} | CPU: {cpu_val}% | Temp: {temp_val}°C | "
-        f"AD936X: {ad936x_val} | Zynq: {zynq_val}"
+    pkt = atak_pb2.TAKPacket(is_compressed=False)
+
+    full_cs = msg['callsign']
+    header_cs = shorten_callsign(full_cs) if msg['type'] == 'system' else full_cs
+    pkt.contact.callsign = pkt.contact.device_callsign = safe_str(header_cs, 120)
+
+    pkt.pli.latitude_i  = int(msg['lat'] * 1e7)
+    pkt.pli.longitude_i = int(msg['lon'] * 1e7)
+    pkt.pli.altitude    = int(msg['alt'])
+
+    if msg['type'] == 'system':
+        remarks     = msg.get('remarks', '')
+        cpu_match   = re.search(r"CPU Usage:\s*([\d\.]+)%",     remarks)
+        temp_match  = re.search(r"Temp:\s*([\d\.]+)°C",         remarks)
+        pluto_match = re.search(r"Pluto:\s*([\w\./]+)",         remarks)
+        zynq_match  = re.search(r"Zynq:\s*([\w\./]+)",          remarks)
+
+        text = (
+            f"{shorten_callsign(full_cs)} | "
+            f"CPU: {cpu_match.group(1) if cpu_match else 'N/A'}% | "
+            f"Temp: {temp_match.group(1) if temp_match else 'N/A'}°C | "
+            f"Pluto: {pluto_match.group(1) if pluto_match else 'N/A'} | "
+            f"Zynq: {zynq_match.group(1) if zynq_match else 'N/A'}"
+        )
+
+    elif msg['type'] == 'drone':
+        text = (
+            f"{full_cs} | RSSI: {msg.get('rssi','N/A')} dBm | "
+            f"MAC: {msg.get('mac','N/A')}"
+        )
+
+    else:  # pilot or home
+        text = full_cs
+
+    pkt.chat.message     = safe_str(text, 256)
+    pkt.chat.to          = pkt.chat.to_callsign = "All Chat Rooms"
+    pkt.group.role       = atak_pb2.MemberRole.TeamMember
+    pkt.group.team       = atak_pb2.Team.Cyan
+
+    return pkt.SerializeToString()
+
+
+def debug_proto(label, data):
+    pkt = atak_pb2.TAKPacket()
+    pkt.ParseFromString(data)
+    logger.debug(f"--- {label} ---\n{pkt}")
+
+# --- ZMQ Parsers ---
+def parse_zmq_drone(raw):
+    """
+    Only emit when we have a Serial Number. Buffer CAA until serial seen.
+    """
+    info = {
+        'lat': 0.0, 'lon': 0.0, 'alt': 0.0,
+        'speed': 0.0, 'rssi': None, 'mac': None, 'id': None
+    }
+    pilot = {}
+    items = raw if isinstance(raw, list) else [raw]
+
+    for itm in items:
+        if not isinstance(itm, dict):
+            continue
+        if 'Basic ID' in itm:
+            b = itm['Basic ID']
+            mac = b.get('MAC')
+            idt = b.get('id_type')
+            info['mac'] = mac
+            info['rssi'] = b.get('RSSI')
+            if idt == 'Serial Number (ANSI/CTA-2063-A)':
+                serial = b.get('id', 'unknown')
+                mac_to_serial[mac] = serial
+                if mac in pending_caa:
+                    info['caa'] = pending_caa.pop(mac)
+                info['id'] = serial
+            elif idt == 'CAA Assigned Registration ID':
+                caa = b.get('id', 'unknown')
+                if mac in mac_to_serial:
+                    info['caa'] = caa
+                else:
+                    pending_caa[mac] = caa
+                    return []
+
+        if 'Location/Vector Message' in itm:
+            v = itm['Location/Vector Message']
+            info.update({
+                'lat':   parse_float(v.get('latitude')),
+                'lon':   parse_float(v.get('longitude')),
+                'alt':   parse_float(v.get('geodetic_altitude')),
+                'speed': parse_float(v.get('speed')),
+            })
+        if 'System Message' in itm:
+            sm = itm['System Message']
+            pilot = {
+                'pilot_lat': parse_float(sm.get('latitude') or sm.get('operator_lat')),
+                'pilot_lon': parse_float(sm.get('longitude') or sm.get('operator_lon')),
+                'home_lat':  parse_float(sm.get('home_lat')),
+                'home_lon':  parse_float(sm.get('home_lon')),
+            }
+
+    # ignore pure‑CAA bursts
+    if not info.get('id'):
+        return []
+
+    cid = info['id']
+    if not cid.startswith('drone-'):
+        cid = f"drone-{cid}"
+
+    msgs = []
+    remark = f"MAC:{info['mac']} RSSI:{info['rssi']}dBm"
+    entry = {
+        'callsign': cid,
+        'type':     'drone',
+        'lat':      info['lat'],
+        'lon':      info['lon'],
+        'alt':      info['alt'],
+        'speed':    info['speed'],
+        'remarks':  remark,
+        'mac':      info['mac'],
+        'rssi':     info['rssi'],
+    }
+    if 'caa' in info:
+        entry['caa'] = info['caa']
+    msgs.append(entry)
+
+    if pilot.get('pilot_lat') or pilot.get('pilot_lon'):
+        pid = cid.split('-', 1)[1]
+        msgs.append({
+            'callsign': f'pilot-{pid}',
+            'type':     'pilot',
+            'lat':      pilot['pilot_lat'],
+            'lon':      pilot['pilot_lon'],
+            'alt':      0,
+            'speed':    0,
+            'remarks':  f"refs {cid}"
+        })
+    if pilot.get('home_lat') or pilot.get('home_lon'):
+        pid = cid.split('-', 1)[1]
+        msgs.append({
+            'callsign': f'home-{pid}',
+            'type':     'home',
+            'lat':      pilot['home_lat'],
+            'lon':      pilot['home_lon'],
+            'alt':      0,
+            'speed':    0,
+            'remarks':  f"refs {cid}"
+        })
+
+    return msgs
+
+
+def parse_zmq_system(raw):
+    serial = raw.get('serial_number', 'unknown')
+    uid = f'wardragon-{serial}'
+    gps  = raw.get('gps_data', {})
+    stats = raw.get('system_stats', {})
+    temps = raw.get('ant_sdr_temps', {})
+    remarks = (
+        f"CPU Usage: {parse_float(stats.get('cpu_usage'))}% "
+        f"Temp: {parse_float(stats.get('temperature'))}°C "
+        f"Pluto: {temps.get('pluto_temp','N/A')} "
+        f"Zynq: {temps.get('zynq_temp','N/A')}"
     )
-    packet.chat.message = safe_str(detailed_message, 256)
-    packet.chat.to = safe_str("All Chat Rooms", 120)
-    packet.chat.to_callsign = safe_str("All Chat Rooms", 120)
-    packet.group.role = atak_pb2.MemberRole.TeamMember
-    packet.group.team = atak_pb2.Team.Cyan
-    logging.info("Constructed GeoChat: %s", packet.chat.message)
-    serialized = packet.SerializeToString()
-    logging.info("Serialized TAKPacket (GeoChat), length: %d bytes", len(serialized))
-    return serialized
+    return [{
+        'callsign': uid,
+        'type':     'system',
+        'lat':      parse_float(gps.get('latitude')),
+        'lon':      parse_float(gps.get('longitude')),
+        'alt':      parse_float(gps.get('altitude')),
+        'speed':    0,
+        'remarks':  remarks
+    }]
 
+# --- Async Send Logic ---
+async def send_packets_async(msg, iface, debug=False):
+    uid = shorten_callsign(msg['callsign'])
+    now = time.time()
 
-# --- Asynchronous Sender for CoT Updates ---
-async def send_packets_async(msg):
-    """
-    Asynchronously send a PLI packet from a CoT message and, for system messages,
-    send a throttled GeoChat packet.
-    """
-    pli_packet = build_atak_pli_packet(msg)
-    if pli_packet is not None:
-        async with tx_lock:
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: interface.sendData(pli_packet, portNum=72, wantAck=False)
-                )
-                logging.info("Sent ATAK PLI packet.")
-            except Exception as e:
-                logging.error("Error sending PLI packet: %s", e)
-    # For system, pilot, and home messages, send as GeoChat (if throttling permits)
-    if msg.get("type") in ["system", "pilot", "home"]:
-        unique_id = shorten_callsign(msg["callsign"])
-        now = time.time()
-        last_time = last_geo_chat_sent.get(unique_id, 0)
-        if now - last_time >= GEO_CHAT_INTERVAL:
-            last_geo_chat_sent[unique_id] = now
-            geochat_packet = build_atak_geochat_packet(msg)
-            if geochat_packet is not None:
-                async with tx_lock:
-                    try:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            lambda: interface.sendData(geochat_packet, portNum=72, wantAck=False)
-                        )
-                        logging.info("Sent ATAK GeoChat packet.")
-                    except Exception as e:
-                        logging.error("Error sending GeoChat packet: %s", e)
-        else:
-            logging.debug("GeoChat throttled for %s.", unique_id)
+    # PLI throttle
+    if msg['type'] == 'drone':
+        pli_int = DRONE_PLI_INTERVAL
     else:
-        logging.debug("GeoChat skipped for %s (not system/pilot/home).", shorten_callsign(msg["callsign"]))
+        pli_int = PILOT_HOME_PLI_INTERVAL
 
+    if now - last_sent_pli.get(uid, 0) >= pli_int:
+        data = build_atak_pli_packet(msg)
+        if debug:
+            debug_proto(f'PLI {uid}', data)
+        async with tx_lock:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: iface.sendData(data, portNum=72, wantAck=False)
+            )
+        last_sent_pli[uid] = now
+        logger.info(f'Sent PLI for {uid}')
 
-# --- Asynchronous Receiver for CoT (UDP) ---
-async def cot_receiver():
-    """Continuously receive CoT messages from UDP multicast and update latest_updates."""
-    loop = asyncio.get_running_loop()
+    # GeoChat throttle
+    if msg['type'] == 'drone':
+        geo_int = DRONE_GEO_INTERVAL
+    elif msg['type'] == 'system':
+        geo_int = SYSTEM_GEO_INTERVAL
+    else:  # pilot or home
+        geo_int = PILOT_HOME_GEO_INTERVAL
+
+    if now - last_sent_geochat.get(uid, 0) >= geo_int:
+        data = build_atak_geochat_packet(msg)
+        if debug:
+            debug_proto(f'GeoChat {uid}', data)
+        async with tx_lock:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: iface.sendData(data, portNum=72, wantAck=False)
+            )
+        last_sent_geochat[uid] = now
+        logger.info(f'Sent GeoChat for {uid}')
+
+# --- ZMQ Listeners & Flusher ---
+async def drone_listener(host, port):
+    ctx = zmq.asyncio.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.connect(f"tcp://{host}:{port}")
+    sock.setsockopt_string(zmq.SUBSCRIBE, '')
+    logger.info(f'Subscribed to drone ZMQ at {host}:{port}')
     while True:
-        data, addr = await loop.run_in_executor(None, sock.recvfrom, 8192)
-        logging.debug("Received CoT from %s", addr)
-        messages = parse_cot(data.decode("utf-8"))
-        for msg in messages:
-            unique_id = shorten_callsign(msg["callsign"])
-            latest_updates[unique_id] = msg
+        raw = await sock.recv_json()
+        for m in parse_zmq_drone(raw):
+            uid = shorten_callsign(m['callsign'])
+            latest_updates[uid] = m
+            last_seen[uid] = time.time()
 
 
-# --- Periodic Flusher for CoT Updates ---
-async def flush_updates(interval=1):
-    """Every 'interval' seconds, send out the latest update for each unique transmitter."""
+async def system_listener(host, port):
+    ctx = zmq.asyncio.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.connect(f"tcp://{host}:{port}")
+    sock.setsockopt_string(zmq.SUBSCRIBE, '')
+    logger.info(f'Subscribed to system ZMQ at {host}:{port}')
     while True:
-        if latest_updates:
-            keys = list(latest_updates.keys())
-            for key in keys:
-                msg = latest_updates.pop(key, None)
-                if msg is not None:
-                    await send_packets_async(msg)
-        await asyncio.sleep(interval)
+        raw = await sock.recv_json()
+        for m in parse_zmq_system(raw):
+            uid = shorten_callsign(m['callsign'])
+            latest_updates[uid] = m
+            last_seen[uid] = time.time()
+        await asyncio.sleep(0)
 
 
-# --- Main Async Function ---
-async def main_async():
-    tasks = [
-        asyncio.create_task(cot_receiver()),
-        asyncio.create_task(flush_updates(interval=1))
-    ]
-    await asyncio.gather(*tasks)
+async def flush_updates(iface, debug=False):
+    while True:
+        now = time.time()
+        # drop stale
+        for uid in list(last_seen):
+            if now - last_seen[uid] > STALE_TIMEOUT:
+                last_seen.pop(uid, None)
+                latest_updates.pop(uid, None)
+                logger.info(f'Dropped stale {uid}')
+        # send all pending updates, including system
+        for uid, msg in list(latest_updates.items()):
+            latest_updates.pop(uid, None)
+            await send_packets_async(msg, iface, debug)
+        await asyncio.sleep(1)
 
 
-# --- Run the Async Loop ---
-if __name__ == "__main__":
+async def main():
+    iface = (meshtastic.serial_interface.SerialInterface(
+                devPath=args.port)
+             if args.port else
+             meshtastic.serial_interface.SerialInterface())
+    logger.info('Meshtastic interface ready')
+    await asyncio.gather(
+        drone_listener(args.zmq_host, args.zmq_drone_port),
+        system_listener(args.zmq_host, args.zmq_system_port),
+        flush_updates(iface, args.debug)
+    )
+
+
+if __name__ == '__main__':
     try:
-        asyncio.run(main_async())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("KeyboardInterrupt received. Stopping...")
-    finally:
-        interface.close()
-        logging.info("Clean shutdown complete.")
+        logger.info('Stopping…')
