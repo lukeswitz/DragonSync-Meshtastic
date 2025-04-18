@@ -1,6 +1,6 @@
 # DragonSync‑Meshtastic
 
-DragonSync‑Meshtastic is a Python asyncio application that bridges Meshtastic devices with remote‑ID and system telemetry feeds over ZeroMQ. It listens on two ZMQ ports—one for drone bursts, one for system status—and relays each unique transmitter’s position and telemetry as compact TAK PLI and GeoChat packets via the Meshtastic serial interface.
+DragonSync‑Meshtastic is a Python asyncio application that bridges Meshtastic devices with remote‑ID, DroneID, and system telemetry feeds over ZeroMQ. It listens on two ZMQ ports—one for drone bursts, one for system status—and relays each unique transmitter’s position and telemetry as compact TAK PLI and GeoChat packets via the Meshtastic serial interface.
 
 > **Note:** This version no longer uses CoT multicast. FPV message processing has been removed to a separate future module.
 
@@ -24,8 +24,9 @@ DragonSync‑Meshtastic is a Python asyncio application that bridges Meshtastic 
 
 DragonSync‑Meshtastic listens on two ZeroMQ subscriptions:
 
-- **Drone feed**: raw Remote‑ID bursts (Serial or CAA IDs, location, RSSI, MAC)  
-- **System feed**: system status (CPU, temperatures, GPS)  
+- **Drone feed**: raw Remote‑ID bursts (Serial or CAA IDs, location, RSSI, MAC) as well as DJI DroneID (Results vary based on Ocusync versions) 
+- **System feed**: system status (CPU, temperatures, GPS)
+- **Spectrum feed**: future possibilty 
 
 It deduplicates by transmitter (buffers CAA until matching serial/MAC seen), throttles PLI and GeoChat packets per‑UID, and sends them over a Meshtastic radio for TAK integration.
 
