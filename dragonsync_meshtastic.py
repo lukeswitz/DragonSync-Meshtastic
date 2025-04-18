@@ -136,36 +136,32 @@ def build_atak_geochat_packet(msg):
     pkt = atak_pb2.TAKPacket(is_compressed=False)
 
     full_cs = msg['callsign']
-    header_cs = (shorten_callsign(full_cs)
-                 if msg['type'] == 'system' else full_cs)
-    pkt.contact.callsign = pkt.contact.device_callsign = safe_str(
-        header_cs, 120)
+    header_cs = shorten_callsign(full_cs) if msg['type'] == 'system' else full_cs
+    pkt.contact.callsign = pkt.contact.device_callsign = safe_str(header_cs, 120)
 
-    # always include a PLI so ATAK can place it on the map
     pkt.pli.latitude_i  = int(msg['lat'] * 1e7)
     pkt.pli.longitude_i = int(msg['lon'] * 1e7)
     pkt.pli.altitude    = int(msg['alt'])
 
     if msg['type'] == 'system':
-        remarks = msg.get('remarks', '')
-        cpu_match = re.search(r"CPU Usage:\s*([\d\.]+)%", remarks)
-        tmp_match = re.search(r"Temperature:\s*([\d\.]+)°C", remarks)
-        pluto_match = re.search(r"(?:Pluto|AD936X)\s*Temp:\s*([\w\./]+)",
-                                remarks)
-        zynq_match = re.search(r"Zynq Temp:\s*([\w\./]+)", remarks)
+        remarks     = msg.get('remarks', '')
+        cpu_match   = re.search(r"CPU Usage:\s*([\d\.]+)%",     remarks)
+        temp_match  = re.search(r"Temp:\s*([\d\.]+)°C",         remarks)
+        pluto_match = re.search(r"Pluto:\s*([\w\./]+)",         remarks)
+        zynq_match  = re.search(r"Zynq:\s*([\w\./]+)",          remarks)
 
         text = (
             f"{shorten_callsign(full_cs)} | "
             f"CPU: {cpu_match.group(1) if cpu_match else 'N/A'}% | "
-            f"Temp: {tmp_match.group(1) if tmp_match else 'N/A'}°C | "
-            f"AD936X: {pluto_match.group(1) if pluto_match else 'N/A'} | "
+            f"Temp: {temp_match.group(1) if temp_match else 'N/A'}°C | "
+            f"Pluto: {pluto_match.group(1) if pluto_match else 'N/A'} | "
             f"Zynq: {zynq_match.group(1) if zynq_match else 'N/A'}"
         )
 
     elif msg['type'] == 'drone':
         text = (
-            f"{full_cs} | RSSI: {msg.get('rssi', 'N/A')} dBm | "
-            f"MAC: {msg.get('mac', 'N/A')}"
+            f"{full_cs} | RSSI: {msg.get('rssi','N/A')} dBm | "
+            f"MAC: {msg.get('mac','N/A')}"
         )
 
     else:  # pilot or home
