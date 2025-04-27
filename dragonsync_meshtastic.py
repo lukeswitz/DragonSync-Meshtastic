@@ -223,6 +223,7 @@ def parse_zmq_drone(raw):
                 'lon':   parse_float(v.get('longitude')),
                 'alt':   parse_float(v.get('geodetic_altitude')),
                 'speed': parse_float(v.get('speed')),
+                'course': parse_float(v.get('direction')),
             })
         if 'System Message' in itm:
             sm = itm['System Message']
@@ -242,17 +243,18 @@ def parse_zmq_drone(raw):
         cid = f"drone-{cid}"
 
     msgs = []
-    remark = f"MAC:{info['mac']} RSSI:{info['rssi']}dBm"
+    remark = f"MAC:{info.get('mac', 'N/A')} RSSI:{info.get('rssi', 'N/A')}dBm"
     entry = {
         'callsign': cid,
         'type':     'drone',
-        'lat':      info['lat'],
-        'lon':      info['lon'],
-        'alt':      info['alt'],
-        'speed':    info['speed'],
+        'lat':      info.get('lat', 0.0),
+        'lon':      info.get('lon', 0.0),
+        'alt':      info.get('alt', 0.0),
+        'speed':    info.get('speed', 0.0),
+        'course': info.get('course', 0)
         'remarks':  remark,
-        'mac':      info['mac'],
-        'rssi':     info['rssi'],
+        'mac':      info.get('mac', N/A),
+        'rssi':     info.get('rssi', N/A),
     }
     if 'caa' in info:
         entry['caa'] = info['caa']
