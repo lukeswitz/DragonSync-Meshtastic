@@ -251,10 +251,10 @@ def parse_zmq_drone(raw):
         'lon':      info.get('lon', 0.0),
         'alt':      info.get('alt', 0.0),
         'speed':    info.get('speed', 0.0),
-        'course': info.get('course', 0)
+        'course': info.get('course', 0),
         'remarks':  remark,
-        'mac':      info.get('mac', N/A),
-        'rssi':     info.get('rssi', N/A),
+        'mac':      info.get('mac', 'N/A'),
+        'rssi':     info.get('rssi', 'N/A'),
     }
     if 'caa' in info:
         entry['caa'] = info['caa']
